@@ -14,7 +14,7 @@ CLCENnetPy is a Python port of **K7CustomNetV2** (C), plus a few cheap improveme
 |---|---|
 | `CLCENnetPy.py` | The engine (single file) |
 | `k7net26k.k7nn` | The default network |
-| `book.txt` | Opening book (653 lines, SAN text) |
+| `book.txt` | Opening book (688 lines, SAN text) |
 | `pypy/` | PyPy3 for Windows, included and ready to use |
 | `CLCENnetPy.c` | Optional launcher source, builds `CLCENnetPy.exe` |
 | `pgn/` | Test games used for the rating estimate below |
