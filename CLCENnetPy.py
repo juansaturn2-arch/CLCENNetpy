@@ -1,0 +1,2370 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+r"""
+CLCENnetPy -- K7CustomNetV2 search + K7 custom NNUE, ported to Python
+10x12 Mailbox + PVS/LMR/Null-move + UCI                     author: K7
+
+Python port of K7CustomNetV2.c, plus the cheap V3 extras:
+  - QSearchTT  transposition table in quiescence
+  - TTEval     TT score sharpens the static eval used for pruning
+  - Fifty      eval shrinks as the 50-move counter grows
+  - TT aging   entries from old searches are replaced first
+  - PV fix     no stale PV moves after TT cutoffs
+  - root accumulator built once per search, every node below is a delta
+
+Processes (UCI spin box, 1-4) -- Lazy SMP with processes:
+  (named "Processes", not "Threads": Arena hides an option called Threads)
+  Processes = 1 is the plain engine with the fast in-process hash table.
+  Processes = 2-4 starts 1-3 helper PyPy processes running this same script
+  ("--helper" mode). They share one hash table in shared memory (lockless,
+  XOR-verified 64-bit entries as in K7CustomNetV3), so each process finds
+  the positions the others already searched. Only the main process talks
+  to the GUI: it prints the total nodes/nps of all processes, its own PV,
+  and the bestmove. Helpers start once and stay alive between moves.
+  Give the opponent the same number of threads in a fair test.
+
+Opening book (OwnBook, BookFile -- default book.txt next to the script):
+  plain text, one game line per row in SAN from the start position. Each
+  move the engine picks a random line that matches the game so far and
+  plays its next move; it stops looking once the game leaves the book.
+
+Net format: K7NN v1 (.bin / .k7nn from k7_train), any hidden size.
+    768 inputs -> H x2 (SCReLU) -> 1
+The smallest nets (64 hidden) are the best fit for Python: every
+accumulator update and output pass is a loop over H values.
+
+Search (UCI check boxes, defaults as in V2/V3):
+  RFP, NullMove+, Futility, LMP, LMR+, SEE, Delta (off), IIR, Ordering+,
+  QSearchTT, TTEval, Fifty.   All off = the V1 search.
+
+Run:
+  CLCENnetPy.exe              <- launcher (CLCENnetPy.c): starts pypy\pypy3.exe
+                                 with this script; point Arena / KULTRA here
+  pypy3 CLCENnetPy.py         <- strongly recommended (5-10x faster JIT)
+  python CLCENnetPy.py        <- works, much slower
+  Standard library only -- no pip installs needed.
+
+Console tools:
+  perft n           (perft 5 from the start = 4865609)
+  bench [depth]     fixed-depth search of 14 positions, prints nodes/nps
+  eval              net score of the current position
+  go nodes N        fixed-node search
+  "pypy3 CLCENnetPy.py bench 6 k7net26k.k7nn" runs bench from the command line
+"""
+
+import sys
+import os
+import time
+import math
+import struct
+import array
+import threading
+import collections
+import queue
+import mmap
+import tempfile
+import subprocess
+
+ENGINE_NAME = "CLCENnetPy"
+ENGINE_AUTHOR = "K7"
+
+MAX_PLY = 64
+INF = 100000
+MATE = 90000
+MATE_BOUND = MATE - MAX_PLY
+EVAL_NONE = -INF - 1
+ACC_PLIES = 256
+TT_DEFAULT_MB = 64
+TT_MAX_MB = 2048
+START_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+
+TT_EXACT, TT_ALPHA, TT_BETA = 0, 1, 2
+
+QUIET, DOUBLE_PUSH, KING_CASTLE, QUEEN_CASTLE, CAPTURE, EP_CAPTURE = 0, 1, 2, 3, 4, 5
+KNIGHT_PROMO, BISHOP_PROMO, ROOK_PROMO, QUEEN_PROMO = 8, 9, 10, 11
+KNIGHT_PROMO_CAP, BISHOP_PROMO_CAP, ROOK_PROMO_CAP, QUEEN_PROMO_CAP = 12, 13, 14, 15
+
+IS_CAP = [t == CAPTURE or t == EP_CAPTURE or t >= KNIGHT_PROMO_CAP for t in range(16)]
+IS_PROMO = [t >= KNIGHT_PROMO for t in range(16)]
+
+# ------------------------------------------------------------------ pieces
+EMPTY = 0
+wP, wN, wB, wR, wQ, wK, bP, bN, bB, bR, bQ, bK = range(1, 13)
+OFF = 13                                  # sentinel square of the 10x12 board
+WHITE, BLACK = 0, 1
+PAWN, KNIGHT, BISHOP, ROOK, QUEEN, KING = range(1, 7)
+
+COLOR = [2, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 2]
+BASE = [0, 1, 2, 3, 4, 5, 6, 1, 2, 3, 4, 5, 6, 0]
+PIECE_CHARS = ".PNBRQKpnbrqk"
+PIECE_VALUE = [0, 100, 320, 330, 500, 900, 20000, 100, 320, 330, 500, 900, 20000, 0]
+SEE_VAL = PIECE_VALUE
+PROMO_PIECE = [wN, wB, wR, wQ]           # index = type & 3
+
+# ----------------------------------------------------------------- squares
+SQ64 = [-1] * 120
+SQ120 = [0] * 64
+for _r in range(8):
+    for _f in range(8):
+        SQ64[21 + _r * 10 + _f] = _r * 8 + _f
+        SQ120[_r * 8 + _f] = 21 + _r * 10 + _f
+RANK = [(s // 10) - 2 for s in range(120)]
+
+A1, B1, C1, D1, E1, F1, G1, H1 = range(21, 29)
+A8, B8, C8, D8, E8, F8, G8, H8 = range(91, 99)
+
+WKCA, WQCA, BKCA, BQCA = 8, 4, 2, 1
+CMASK = [15] * 120
+CMASK[E1] = 15 & ~(WKCA | WQCA)
+CMASK[E8] = 15 & ~(BKCA | BQCA)
+CMASK[H1] = 15 & ~WKCA
+CMASK[A1] = 15 & ~WQCA
+CMASK[H8] = 15 & ~BKCA
+CMASK[A8] = 15 & ~BQCA
+
+# (rook, from, to) for each side / castle type
+CASTLE_ROOK = {
+    (WHITE, KING_CASTLE): (wR, H1, F1), (WHITE, QUEEN_CASTLE): (wR, A1, D1),
+    (BLACK, KING_CASTLE): (bR, H8, F8), (BLACK, QUEEN_CASTLE): (bR, A8, D8),
+}
+
+KNIGHT_DIRS = (-21, -19, -12, -8, 8, 12, 19, 21)
+BISHOP_DIRS = (-11, -9, 9, 11)
+ROOK_DIRS = (-10, -1, 1, 10)
+KING_DIRS = (-11, -10, -9, -1, 1, 9, 10, 11)
+QUEEN_DIRS = (-10, -1, 1, 10, -11, -9, 9, 11)
+SLIDER_DIRS = [None, None, None, BISHOP_DIRS, ROOK_DIRS, QUEEN_DIRS, None]
+
+# ----------------------------------------------------------------- zobrist
+M64 = (1 << 64) - 1
+_rs = [0x9E3779B97F4A7C15]
+
+
+def rand64():
+    x = _rs[0]
+    x ^= (x << 13) & M64
+    x ^= x >> 7
+    x ^= (x << 17) & M64
+    _rs[0] = x
+    return x
+
+
+ZP = [0] * (14 * 120)
+for _p in range(13):
+    for _s in range(120):
+        ZP[_p * 120 + _s] = rand64()
+ZC = [rand64() for _ in range(16)]
+ZEP = [rand64() for _ in range(120)]
+ZSIDE = rand64()
+
+
+def tdiv(a, b):
+    """C-style integer division (truncates toward zero)."""
+    q = abs(a) // abs(b)
+    return q if (a < 0) == (b < 0) else -q
+
+
+def out(s):
+    sys.stdout.write(s + "\n")
+    sys.stdout.flush()
+
+
+# =================================================================== board
+
+def attacked(b, sq, by):
+    """Is square `sq` attacked by side `by`?"""
+    if by == WHITE:
+        if b[sq - 11] == wP or b[sq - 9] == wP:
+            return True
+        n, bi, r, q, k = wN, wB, wR, wQ, wK
+    else:
+        if b[sq + 11] == bP or b[sq + 9] == bP:
+            return True
+        n, bi, r, q, k = bN, bB, bR, bQ, bK
+    for d in KNIGHT_DIRS:
+        if b[sq + d] == n:
+            return True
+    for d in KING_DIRS:
+        if b[sq + d] == k:
+            return True
+    for d in ROOK_DIRS:
+        t = sq + d
+        p = b[t]
+        while p == EMPTY:
+            t += d
+            p = b[t]
+        if p == r or p == q:
+            return True
+    for d in BISHOP_DIRS:
+        t = sq + d
+        p = b[t]
+        while p == EMPTY:
+            t += d
+            p = b[t]
+        if p == bi or p == q:
+            return True
+    return False
+
+
+class Board(object):
+    __slots__ = ("b", "stm", "ep", "castle", "fifty", "ksq", "pcount",
+                 "hash", "undo", "acc", "acc_base")
+
+    def __init__(self):
+        self.acc = None          # [white list, black list] of accumulators per ply
+        self.acc_base = 0
+        self.parse_fen(START_FEN)
+
+    # ---------------------------------------------------------------- setup
+    def clear(self):
+        self.b = [OFF] * 120
+        for s in SQ120:
+            self.b[s] = EMPTY
+        self.stm = WHITE
+        self.ep = 0              # 0 = no en-passant square
+        self.castle = 0
+        self.fifty = 0
+        self.ksq = [E1, E8]
+        self.pcount = [0] * 14
+        self.hash = 0
+        self.undo = []
+        self.acc = None
+        self.acc_base = 0
+
+    def compute_hash(self):
+        h = 0
+        b = self.b
+        for s in SQ120:
+            if b[s] != EMPTY:
+                h ^= ZP[b[s] * 120 + s]
+        if self.stm == BLACK:
+            h ^= ZSIDE
+        if self.ep:
+            h ^= ZEP[self.ep]
+        h ^= ZC[self.castle]
+        return h
+
+    def parse_fen(self, fen):
+        self.clear()
+        parts = fen.split()
+        sq = A8
+        for ch in parts[0] if parts else "":
+            if "1" <= ch <= "8":
+                sq += ord(ch) - 48
+            elif ch == "/":
+                sq -= 18
+            else:
+                idx = PIECE_CHARS.find(ch)
+                if idx > 0:
+                    if SQ64[sq] >= 0:
+                        self.b[sq] = idx
+                        self.pcount[idx] += 1
+                        if idx == wK:
+                            self.ksq[WHITE] = sq
+                        elif idx == bK:
+                            self.ksq[BLACK] = sq
+                    sq += 1
+        self.stm = BLACK if len(parts) > 1 and parts[1] == "b" else WHITE
+        c = 0
+        if len(parts) > 2:
+            for ch in parts[2]:
+                if ch == "K":
+                    c |= WKCA
+                elif ch == "Q":
+                    c |= WQCA
+                elif ch == "k":
+                    c |= BKCA
+                elif ch == "q":
+                    c |= BQCA
+        self.castle = c
+        self.ep = 0
+        if len(parts) > 3 and parts[3] != "-":
+            e = str_to_sq(parts[3])
+            if e > 0:
+                self.ep = e
+        if len(parts) > 4 and parts[4].isdigit():
+            self.fifty = int(parts[4])
+        self.hash = self.compute_hash()
+
+    # ----------------------------------------------------------- make/undo
+    def make_move(self, m):
+        frm = (m >> 11) & 127
+        to = (m >> 4) & 127
+        ty = m & 15
+        b = self.b
+        stm = self.stm
+        pc = self.pcount
+        piece = b[frm]
+        cap = b[to]
+        ep = self.ep
+        castle = self.castle
+        fifty = self.fifty
+        h = self.hash
+
+        if ep:
+            h ^= ZEP[ep]
+        nep = 0
+        h ^= ZP[piece * 120 + frm] ^ ZP[piece * 120 + to]
+        b[frm] = EMPTY
+        if cap:
+            h ^= ZP[cap * 120 + to]
+            pc[cap] -= 1
+            rem = (piece * 64 + SQ64[frm], cap * 64 + SQ64[to])
+        else:
+            rem = (piece * 64 + SQ64[frm],)
+        b[to] = piece
+        nfifty = 0 if (BASE[piece] == PAWN or cap) else fifty + 1
+        extra_add = -1
+
+        if ty == DOUBLE_PUSH:
+            nep = frm + (10 if stm == WHITE else -10)
+            h ^= ZEP[nep]
+        elif ty == EP_CAPTURE:
+            if stm == WHITE:
+                csq = to - 10
+                cp = bP
+            else:
+                csq = to + 10
+                cp = wP
+            h ^= ZP[cp * 120 + csq]
+            b[csq] = EMPTY
+            pc[cp] -= 1
+            rem = (piece * 64 + SQ64[frm], cp * 64 + SQ64[csq])
+        elif ty == KING_CASTLE or ty == QUEEN_CASTLE:
+            rook, rf, rt = CASTLE_ROOK[(stm, ty)]
+            h ^= ZP[rook * 120 + rf] ^ ZP[rook * 120 + rt]
+            b[rf] = EMPTY
+            b[rt] = rook
+            rem = (piece * 64 + SQ64[frm], rook * 64 + SQ64[rf])
+            extra_add = rook * 64 + SQ64[rt]
+        elif ty >= KNIGHT_PROMO:
+            pp = PROMO_PIECE[ty & 3] + (6 if stm == BLACK else 0)
+            h ^= ZP[piece * 120 + to] ^ ZP[pp * 120 + to]
+            b[to] = pp
+            pc[piece] -= 1
+            pc[pp] += 1
+
+        last = b[to] * 64 + SQ64[to]
+        add = (last,) if extra_add < 0 else (extra_add, last)
+
+        if BASE[piece] == KING:
+            self.ksq[stm] = to
+
+        nc = castle & CMASK[frm] & CMASK[to]
+        if nc != castle:
+            h ^= ZC[castle] ^ ZC[nc]
+        h ^= ZSIDE
+
+        self.undo.append((m, ep, castle, cap, fifty, self.hash, rem, add))
+        self.hash = h
+        self.ep = nep
+        self.castle = nc
+        self.fifty = nfifty
+        self.stm = stm ^ 1
+
+        acc = self.acc
+        if acc is not None:
+            i = len(self.undo) - self.acc_base
+            if 0 <= i < ACC_PLIES:
+                acc[0][i] = None
+                acc[1][i] = None
+
+    def undo_move(self):
+        m, ep, castle, cap, fifty, h, rem, add = self.undo.pop()
+        frm = (m >> 11) & 127
+        to = (m >> 4) & 127
+        ty = m & 15
+        stm = self.stm ^ 1
+        self.stm = stm
+        b = self.b
+        pc = self.pcount
+
+        piece = b[to]
+        b[to] = cap
+        if cap:
+            pc[cap] += 1
+        if ty >= KNIGHT_PROMO:
+            pawn = wP if stm == WHITE else bP
+            b[frm] = pawn
+            pc[piece] -= 1
+            pc[pawn] += 1
+            piece = pawn
+        else:
+            b[frm] = piece
+
+        if ty == KING_CASTLE or ty == QUEEN_CASTLE:
+            rook, rf, rt = CASTLE_ROOK[(stm, ty)]
+            b[rt] = EMPTY
+            b[rf] = rook
+        elif ty == EP_CAPTURE:
+            if stm == WHITE:
+                b[to - 10] = bP
+                pc[bP] += 1
+            else:
+                b[to + 10] = wP
+                pc[wP] += 1
+
+        if BASE[piece] == KING:
+            self.ksq[stm] = frm
+        self.hash = h
+        self.ep = ep
+        self.castle = castle
+        self.fifty = fifty
+
+    def make_null(self):
+        self.undo.append((0, self.ep, self.castle, EMPTY, self.fifty, self.hash, (), ()))
+        h = self.hash
+        if self.ep:
+            h ^= ZEP[self.ep]
+        self.ep = 0
+        self.hash = h ^ ZSIDE
+        self.stm ^= 1
+        acc = self.acc
+        if acc is not None:
+            i = len(self.undo) - self.acc_base
+            if 0 <= i < ACC_PLIES:
+                acc[0][i] = None
+                acc[1][i] = None
+
+    def undo_null(self):
+        m, ep, castle, cap, fifty, h, rem, add = self.undo.pop()
+        self.stm ^= 1
+        self.hash = h
+        self.ep = ep
+        self.castle = castle
+        self.fifty = fifty
+
+    # ------------------------------------------------------------- draws
+    def is_rep(self):
+        u = self.undo
+        n = len(u)
+        start = n - self.fifty
+        if start < 0:
+            start = 0
+        h = self.hash
+        i = n - 2                      # same side to move: every 2nd entry
+        while i >= start:
+            if u[i][5] == h:
+                return True
+            i -= 2
+        return False
+
+    def has_npm(self, side):
+        c = self.pcount
+        o = 6 if side == BLACK else 0
+        return (c[o + 2] + c[o + 3] + c[o + 4] + c[o + 5]) > 0
+
+    def insufficient(self):
+        c = self.pcount
+        if c[wP] or c[bP] or c[wR] or c[bR] or c[wQ] or c[bQ]:
+            return False
+        return c[wN] + c[wB] + c[bN] + c[bB] <= 1
+
+    def in_check(self):
+        return attacked(self.b, self.ksq[self.stm], self.stm ^ 1)
+
+
+# ----------------------------------------------------------- move generator
+
+def gen_moves(bd, caps_only):
+    """Pseudo-legal moves. caps_only: captures and promotions (quiescence)."""
+    b = bd.b
+    stm = bd.stm
+    enemy = stm ^ 1
+    moves = []
+    add = moves.append
+    if stm == WHITE:
+        up, start_rank, promo_rank, cdirs = 10, 1, 7, (9, 11)
+    else:
+        up, start_rank, promo_rank, cdirs = -10, 6, 0, (-11, -9)
+    ep = bd.ep
+
+    for sq in SQ120:
+        p = b[sq]
+        if p == EMPTY or COLOR[p] != stm:
+            continue
+        t = BASE[p]
+        f = sq << 11
+        if t == PAWN:
+            to = sq + up
+            if b[to] == EMPTY:
+                if RANK[to] == promo_rank:
+                    add(f | to << 4 | QUEEN_PROMO)
+                    add(f | to << 4 | ROOK_PROMO)
+                    add(f | to << 4 | BISHOP_PROMO)
+                    add(f | to << 4 | KNIGHT_PROMO)
+                elif not caps_only:
+                    add(f | to << 4)
+                    if RANK[sq] == start_rank and b[to + up] == EMPTY:
+                        add(f | (to + up) << 4 | DOUBLE_PUSH)
+            for dd in cdirs:
+                ct = sq + dd
+                tg = b[ct]
+                if COLOR[tg] == enemy:
+                    if RANK[ct] == promo_rank:
+                        add(f | ct << 4 | QUEEN_PROMO_CAP)
+                        add(f | ct << 4 | ROOK_PROMO_CAP)
+                        add(f | ct << 4 | BISHOP_PROMO_CAP)
+                        add(f | ct << 4 | KNIGHT_PROMO_CAP)
+                    else:
+                        add(f | ct << 4 | CAPTURE)
+                elif tg == EMPTY and ep and ct == ep:
+                    add(f | ct << 4 | EP_CAPTURE)
+        elif t == KNIGHT or t == KING:
+            for d in (KNIGHT_DIRS if t == KNIGHT else KING_DIRS):
+                to = sq + d
+                tg = b[to]
+                if tg == EMPTY:
+                    if not caps_only:
+                        add(f | to << 4)
+                elif COLOR[tg] == enemy:
+                    add(f | to << 4 | CAPTURE)
+            if t == KING and not caps_only:
+                c = bd.castle
+                if stm == WHITE and sq == E1:
+                    if (c & WKCA and b[F1] == EMPTY and b[G1] == EMPTY and b[H1] == wR
+                            and not attacked(b, E1, BLACK) and not attacked(b, F1, BLACK)
+                            and not attacked(b, G1, BLACK)):
+                        add(E1 << 11 | G1 << 4 | KING_CASTLE)
+                    if (c & WQCA and b[D1] == EMPTY and b[C1] == EMPTY and b[B1] == EMPTY
+                            and b[A1] == wR and not attacked(b, E1, BLACK)
+                            and not attacked(b, D1, BLACK) and not attacked(b, C1, BLACK)):
+                        add(E1 << 11 | C1 << 4 | QUEEN_CASTLE)
+                elif stm == BLACK and sq == E8:
+                    if (c & BKCA and b[F8] == EMPTY and b[G8] == EMPTY and b[H8] == bR
+                            and not attacked(b, E8, WHITE) and not attacked(b, F8, WHITE)
+                            and not attacked(b, G8, WHITE)):
+                        add(E8 << 11 | G8 << 4 | KING_CASTLE)
+                    if (c & BQCA and b[D8] == EMPTY and b[C8] == EMPTY and b[B8] == EMPTY
+                            and b[A8] == bR and not attacked(b, E8, WHITE)
+                            and not attacked(b, D8, WHITE) and not attacked(b, C8, WHITE)):
+                        add(E8 << 11 | C8 << 4 | QUEEN_CASTLE)
+        else:
+            for d in SLIDER_DIRS[t]:
+                to = sq + d
+                tg = b[to]
+                while tg == EMPTY:
+                    if not caps_only:
+                        add(f | to << 4)
+                    to += d
+                    tg = b[to]
+                if COLOR[tg] == enemy:
+                    add(f | to << 4 | CAPTURE)
+    return moves
+
+
+def gen_legal(bd):
+    us = bd.stm
+    res = []
+    for m in gen_moves(bd, False):
+        bd.make_move(m)
+        if not attacked(bd.b, bd.ksq[us], us ^ 1):
+            res.append(m)
+        bd.undo_move()
+    return res
+
+
+def perft(bd, depth):
+    if depth == 0:
+        return 1
+    us = bd.stm
+    n = 0
+    for m in gen_moves(bd, False):
+        bd.make_move(m)
+        if not attacked(bd.b, bd.ksq[us], us ^ 1):
+            n += 1 if depth == 1 else perft(bd, depth - 1)
+        bd.undo_move()
+    return n
+
+
+def sq_to_str(sq):
+    if SQ64[sq] < 0:
+        return "??"
+    return chr(97 + (sq % 10) - 1) + chr(49 + RANK[sq])
+
+
+def str_to_sq(s):
+    if len(s) < 2:
+        return -1
+    f = ord(s[0]) - 97
+    r = ord(s[1]) - 49
+    if f < 0 or f > 7 or r < 0 or r > 7:
+        return -1
+    return 21 + r * 10 + f
+
+
+def move_to_str(m):
+    s = sq_to_str((m >> 11) & 127) + sq_to_str((m >> 4) & 127)
+    ty = m & 15
+    if ty >= KNIGHT_PROMO:
+        s += "nbrq"[ty & 3]
+    return s
+
+
+def str_to_move(bd, s):
+    if len(s) < 4:
+        return 0
+    frm = str_to_sq(s[0:2])
+    to = str_to_sq(s[2:4])
+    if frm < 0 or to < 0:
+        return 0
+    for m in gen_legal(bd):
+        if (m >> 11) & 127 != frm or (m >> 4) & 127 != to:
+            continue
+        ty = m & 15
+        if ty >= KNIGHT_PROMO:
+            want = s[4].lower() if len(s) > 4 else "q"
+            if "nbrq"[ty & 3] != want:
+                continue
+        return m
+    return 0
+
+
+# ===================================================================== SEE
+
+def lva_square(b, sq, side):
+    if side == WHITE:
+        if b[sq - 11] == wP:
+            return sq - 11
+        if b[sq - 9] == wP:
+            return sq - 9
+        kn, bi, rk, qu, kg = wN, wB, wR, wQ, wK
+    else:
+        if b[sq + 11] == bP:
+            return sq + 11
+        if b[sq + 9] == bP:
+            return sq + 9
+        kn, bi, rk, qu, kg = bN, bB, bR, bQ, bK
+    for d in KNIGHT_DIRS:
+        if b[sq + d] == kn:
+            return sq + d
+    qsq = 0
+    for d in BISHOP_DIRS:                 # diagonals: bishop before queen
+        t = sq + d
+        p = b[t]
+        while p == EMPTY:
+            t += d
+            p = b[t]
+        if p == bi:
+            return t
+        if p == qu and not qsq:
+            qsq = t
+    for d in ROOK_DIRS:                   # lines: rook before queen
+        t = sq + d
+        p = b[t]
+        while p == EMPTY:
+            t += d
+            p = b[t]
+        if p == rk:
+            return t
+        if p == qu and not qsq:
+            qsq = t
+    if qsq:
+        return qsq
+    for d in KING_DIRS:
+        if b[sq + d] == kg:
+            return sq + d
+    return 0
+
+
+def see(bd, m):
+    """Static exchange evaluation of move m for the side making it."""
+    b = bd.b[:]
+    frm = (m >> 11) & 127
+    to = (m >> 4) & 127
+    ty = m & 15
+    piece = b[frm]
+    side = COLOR[piece]
+    if ty == EP_CAPTURE:
+        captured = bP if side == WHITE else wP
+        b[to + (-10 if side == WHITE else 10)] = EMPTY
+    else:
+        captured = b[to]
+    gain = [0] * 40
+    gain[0] = SEE_VAL[captured] if captured else 0
+    if ty >= KNIGHT_PROMO:
+        piece = PROMO_PIECE[ty & 3] + (6 if side == BLACK else 0)
+        gain[0] += SEE_VAL[piece] - 100
+    from_sq = frm
+    d = 0
+    while True:
+        d += 1
+        gain[d] = SEE_VAL[piece] - gain[d - 1]
+        b[from_sq] = EMPTY
+        side ^= 1
+        from_sq = lva_square(b, to, side)
+        if not from_sq:
+            break
+        piece = b[from_sq]
+        if BASE[piece] == KING:           # king may not take a defended piece
+            b[from_sq] = EMPTY
+            if lva_square(b, to, side ^ 1):
+                b[from_sq] = piece
+                break
+            b[from_sq] = piece
+        if d >= 38:
+            break
+    d -= 1
+    while d:
+        a = -gain[d - 1]
+        g = gain[d]
+        gain[d - 1] = -(a if a > g else g)
+        d -= 1
+    return gain[0]
+
+
+# ============================================================ K7 custom NET
+
+nn_loaded = False
+nn_H = 0
+nn_QA = 255
+nn_QB = 64
+nn_SCALE = 400
+nn_B1 = None
+nn_W2S = None          # side to move half of the output weights
+nn_W2O = None          # other side half
+nn_B2 = 0
+nn_ROWS = [None, None] # [persp] -> list[piece*64 + s64] -> weight row
+nn_path = "k7net26k.k7nn"
+net_tried = False
+
+
+def nn_free():
+    global nn_loaded, nn_H, nn_B1, nn_W2S, nn_W2O, nn_ROWS
+    nn_loaded = False
+    nn_H = 0
+    nn_B1 = nn_W2S = nn_W2O = None
+    nn_ROWS = [None, None]
+
+
+def nn_feature(persp, piece, s64):
+    color = COLOR[piece]
+    t = BASE[piece] - 1
+    if persp == WHITE:
+        return color * 384 + t * 64 + s64
+    return (color ^ 1) * 384 + t * 64 + (s64 ^ 56)
+
+
+def resolve_path(path):
+    if os.path.isfile(path):
+        return path
+    here = os.path.join(os.path.dirname(os.path.abspath(__file__)), path)
+    if os.path.isfile(here):
+        return here
+    return path
+
+
+def nn_load(path):
+    global nn_loaded, nn_H, nn_QA, nn_QB, nn_SCALE, nn_B1, nn_W2S, nn_W2O, nn_B2, nn_ROWS
+    nn_free()
+    full = resolve_path(path)
+    try:
+        with open(full, "rb") as f:
+            d = f.read()
+    except (IOError, OSError):
+        out("info string NetFile: cannot open %s" % path)
+        return False
+    if len(d) < 24:
+        out("info string NetFile: %s is too small to be a K7 net" % path)
+        return False
+    magic, ver, H, QA, QB, SC = struct.unpack_from("<4sIIIII", d, 0)
+    if magic != b"K7NN" or ver != 1:
+        out("info string NetFile: %s is not a K7NN v1 net (make it with k7_train)" % path)
+        return False
+    nshort = 768 * H + H + 2 * H
+    need = 24 + 2 * nshort + 4
+    if H <= 0 or H > 4096 or QA <= 0 or QA > 32767 or QB <= 0 or len(d) != need:
+        out("info string NetFile: %s has a bad header or size" % path)
+        return False
+
+    a = array.array("h")
+    a.frombytes(d[24:24 + 2 * nshort])
+    if sys.byteorder == "big":
+        a.byteswap()
+    w = a.tolist()
+    W1 = [w[i * H:(i + 1) * H] for i in range(768)]
+    nn_B1 = w[768 * H:768 * H + H]
+    nn_W2S = w[769 * H:770 * H]
+    nn_W2O = w[770 * H:771 * H]
+    nn_B2 = struct.unpack_from("<i", d, need - 4)[0]
+    nn_H, nn_QA, nn_QB, nn_SCALE = H, QA, QB, SC
+
+    rows = [[None] * (13 * 64), [None] * (13 * 64)]
+    for persp in (WHITE, BLACK):
+        for piece in range(1, 13):
+            for s64 in range(64):
+                rows[persp][piece * 64 + s64] = W1[nn_feature(persp, piece, s64)]
+    nn_ROWS = rows
+    nn_loaded = True
+    out("info string NetFile: loaded %s (768 -> %dx2 -> 1, %d bytes)" % (path, H, len(d)))
+    return True
+
+
+def ensure_net():
+    global net_tried
+    if nn_loaded or net_tried:
+        return
+    net_tried = True
+    if not nn_load(nn_path):
+        out("info string NO NET LOADED -- playing on material only. "
+            "Set NetFile to a k7_train net (.bin/.k7nn)")
+
+
+def nn_refresh(bd, p):
+    acc = nn_B1[:]
+    rows = nn_ROWS[p]
+    b = bd.b
+    H = nn_H
+    for s in SQ120:
+        pc = b[s]
+        if pc:
+            row = rows[pc * 64 + SQ64[s]]
+            for i in range(H):
+                acc[i] += row[i]
+    return acc
+
+
+def nn_apply(src, u, rows):
+    """src accumulator + this move's feature delta (new list; src untouched)."""
+    rem = u[6]
+    add = u[7]
+    nr = len(rem)
+    na = len(add)
+    if nr == 1 and na == 1:
+        return [s - x + y for s, x, y in zip(src, rows[rem[0]], rows[add[0]])]
+    if nr == 2 and na == 1:
+        return [s - x - z + y for s, x, z, y in
+                zip(src, rows[rem[0]], rows[rem[1]], rows[add[0]])]
+    if nr == 2 and na == 2:
+        return [s - x - z + y + v for s, x, z, y, v in
+                zip(src, rows[rem[0]], rows[rem[1]], rows[add[0]], rows[add[1]])]
+    if nr == 0 and na == 0:            # null move: nothing changes
+        return src
+    acc = src[:]
+    H = len(acc)
+    for f in rem:
+        r = rows[f]
+        for i in range(H):
+            acc[i] -= r[i]
+    for f in add:
+        r = rows[f]
+        for i in range(H):
+            acc[i] += r[i]
+    return acc
+
+
+def nn_get(bd, p, h):
+    """Accumulator of perspective p at search ply h (h = current ply)."""
+    accs = bd.acc[p]
+    a = accs[h]
+    if a is not None:
+        return a
+    j = h
+    steps = 0
+    while accs[j] is None:
+        if j == 0 or steps >= 32:
+            a = nn_refresh(bd, p)
+            accs[h] = a
+            return a
+        j -= 1
+        steps += 1
+    rows = nn_ROWS[p]
+    undo = bd.undo
+    base = bd.acc_base
+    a = accs[j]
+    for k in range(j, h):
+        a = nn_apply(a, undo[base + k], rows)
+        accs[k + 1] = a
+    return a
+
+
+def acc_setup(bd):
+    """Fresh accumulator stack for a search rooted at the current position."""
+    bd.acc_base = len(bd.undo)
+    bd.acc = [[None] * ACC_PLIES, [None] * ACC_PLIES]
+    if nn_loaded:
+        bd.acc[0][0] = nn_refresh(bd, WHITE)
+        bd.acc[1][0] = nn_refresh(bd, BLACK)
+
+
+def eval_net(bd):
+    h = len(bd.undo) - bd.acc_base
+    aw = nn_get(bd, WHITE, h)
+    ab = nn_get(bd, BLACK, h)
+    if bd.stm == WHITE:
+        a_s, a_o = aw, ab
+    else:
+        a_s, a_o = ab, aw
+    QA = nn_QA
+    s = 0
+    for v, w in zip(a_s, nn_W2S):
+        if v > 0:
+            if v > QA:
+                v = QA
+            s += v * v * w
+    for v, w in zip(a_o, nn_W2O):
+        if v > 0:
+            if v > QA:
+                v = QA
+            s += v * v * w
+    o = tdiv(s, QA) + nn_B2
+    o = tdiv(o * nn_SCALE, QA * nn_QB)
+    if o > 20000:
+        o = 20000
+    elif o < -20000:
+        o = -20000
+    return o
+
+
+def eval_material(bd):
+    b = bd.b
+    s = 0
+    for sq in SQ120:
+        p = b[sq]
+        if p == EMPTY or BASE[p] == KING:
+            continue
+        s += -PIECE_VALUE[p] if COLOR[p] == BLACK else PIECE_VALUE[p]
+    return s if bd.stm == WHITE else -s
+
+
+# ------------------------------------------------------------- eval cache
+EC_SIZE = 1 << 18
+EC_MASK = EC_SIZE - 1
+ec_key = [0] * EC_SIZE
+ec_val = [0] * EC_SIZE
+
+
+def eval_cache_clear():
+    global ec_key, ec_val
+    ec_key = [0] * EC_SIZE
+    ec_val = [0] * EC_SIZE
+
+
+def evaluate(bd):
+    if nn_loaded:
+        h = bd.hash
+        i = h & EC_MASK
+        if ec_key[i] == h:
+            s = ec_val[i]
+        else:
+            s = eval_net(bd)
+            ec_key[i] = h
+            ec_val[i] = s
+    else:
+        s = eval_material(bd)
+    if opt_fifty:
+        s = tdiv(s * (200 - bd.fifty), 200)
+    return s
+
+
+# ====================================================== transposition table
+tt_keys = []
+tt_vals = []
+tt_mask = 0
+g_age = 0
+
+
+def tt_resize(mb):
+    global tt_keys, tt_vals, tt_mask
+    mb = max(1, min(mb, TT_MAX_MB))
+    entries = 1
+    while entries * 2 * 64 <= mb * 1024 * 1024:   # ~64 bytes per entry in Python
+        entries *= 2
+    tt_keys = [0] * entries
+    tt_vals = [None] * entries
+    tt_mask = entries - 1
+
+
+def tt_clear():
+    global g_age
+    if sh_mv is not None:
+        sh_clear()
+    else:
+        tt_resize_same()
+    g_age = 0
+
+
+def tt_resize_same():
+    global tt_keys, tt_vals
+    n = tt_mask + 1
+    tt_keys = [0] * n
+    tt_vals = [None] * n
+
+
+def _tt_read_list(h):
+    """(move, score, depth, flag, age) or None"""
+    i = h & tt_mask
+    if tt_keys[i] == h:
+        return tt_vals[i]
+    return None
+
+
+def score_from_tt(sc, ply):
+    if sc > MATE_BOUND:
+        return sc - ply
+    if sc < -MATE_BOUND:
+        return sc + ply
+    return sc
+
+
+def _tt_store_list(h, depth, ply, score, flag, move):
+    if score > MATE_BOUND:
+        score += ply
+    elif score < -MATE_BOUND:
+        score -= ply
+    if depth < 0:
+        depth = 0
+    elif depth > 255:
+        depth = 255
+    i = h & tt_mask
+    od = tt_vals[i]
+    age = g_age & 255
+    if od is not None:
+        if tt_keys[i] == h:                    # same position
+            if not move:
+                move = od[0]
+            if flag != TT_EXACT and od[4] == age and depth + 2 < od[2]:
+                return
+        elif od[4] == age and depth < od[2]:   # keep the deeper current entry
+            return
+    tt_keys[i] = h
+    tt_vals[i] = (move, score, depth, flag, age)
+
+
+def _tt_hashfull_list():
+    n = min(1000, tt_mask + 1)
+    age = g_age & 255
+    used = 0
+    for i in range(n):
+        v = tt_vals[i]
+        if v is not None and v[4] == age:
+            used += 1
+    return used * 1000 // n
+
+
+# ---------------------------------------------- shared TT (Threads 2-4)
+# Shared memory = array of unsigned 64-bit words:
+#   [0]            active search id (0 = stop) -- helpers search while it
+#                  equals the id they were given
+#   [2 .. 2+3]     node counter of helper 1..3
+#   [SH_HDR ...]   TT entries, 2 words each: key ^ data, data
+# data = move:18 | score+2^19:20 | depth:8 | flag:2 | age:8   (as in V3)
+SH_HDR = 8
+sh_mm = None          # mmap object
+sh_mv = None          # memoryview cast to 'Q'
+sh_mask = 0
+sh_info = None        # (name, mode, nbytes, entries) passed to helpers
+
+
+def _tt_read_shared(h):
+    mv = sh_mv
+    i = SH_HDR + ((h & sh_mask) << 1)
+    d = mv[i + 1]
+    if d and (mv[i] ^ d) == h:               # torn write -> no match
+        return (d & 0x3FFFF, ((d >> 18) & 0xFFFFF) - 524288,
+                (d >> 38) & 255, (d >> 46) & 3, (d >> 48) & 255)
+    return None
+
+
+def _tt_store_shared(h, depth, ply, score, flag, move):
+    if score > MATE_BOUND:
+        score += ply
+    elif score < -MATE_BOUND:
+        score -= ply
+    if depth < 0:
+        depth = 0
+    elif depth > 255:
+        depth = 255
+    mv = sh_mv
+    i = SH_HDR + ((h & sh_mask) << 1)
+    od = mv[i + 1]
+    age = g_age & 255
+    if od:
+        if (mv[i] ^ od) == h:                  # same position
+            if not move:
+                move = od & 0x3FFFF
+            if flag != TT_EXACT and ((od >> 48) & 255) == age and depth + 2 < ((od >> 38) & 255):
+                return
+        elif ((od >> 48) & 255) == age and depth < ((od >> 38) & 255):
+            return
+    nd = ((move & 0x3FFFF) | (((score + 524288) & 0xFFFFF) << 18)
+          | (depth << 38) | ((flag & 3) << 46) | (age << 48))
+    mv[i + 1] = nd
+    mv[i] = h ^ nd
+
+
+def _tt_hashfull_shared():
+    mv = sh_mv
+    n = min(1000, sh_mask + 1)
+    age = g_age & 255
+    used = 0
+    for k in range(n):
+        d = mv[SH_HDR + 2 * k + 1]
+        if d and ((d >> 48) & 255) == age:
+            used += 1
+    return used * 1000 // n
+
+
+def sh_clear():
+    """Zero the TT part of shared memory."""
+    start = SH_HDR * 8
+    end = len(sh_mm)
+    chunk = 1 << 22
+    zero = bytes(chunk)
+    off = start
+    while off < end:
+        n = min(chunk, end - off)
+        sh_mm[off:off + n] = zero if n == chunk else bytes(n)
+        off += n
+
+
+tt_read = _tt_read_list
+tt_store = _tt_store_list
+tt_hashfull = _tt_hashfull_list
+
+
+def use_shared_tt(mm, entries):
+    """Switch the TT functions to shared memory (mm) or back to lists (None)."""
+    global tt_read, tt_store, tt_hashfull, sh_mm, sh_mv, sh_mask
+    if mm is None:
+        if sh_mv is not None:
+            sh_mv.release()
+        if sh_mm is not None:
+            try:
+                sh_mm.close()
+            except Exception:
+                pass
+        sh_mm = sh_mv = None
+        sh_mask = 0
+        tt_read, tt_store, tt_hashfull = _tt_read_list, _tt_store_list, _tt_hashfull_list
+    else:
+        sh_mm = mm
+        sh_mv = memoryview(mm).cast("Q")
+        sh_mask = entries - 1
+        tt_read, tt_store, tt_hashfull = _tt_read_shared, _tt_store_shared, _tt_hashfull_shared
+
+
+def shm_create(nbytes):
+    """New zero-filled shared block. Windows: named mapping; else a temp file."""
+    name = "CLCENnetPy_%d_%d" % (os.getpid(), int(time.time() * 1000) % 100000000)
+    if os.name == "nt":
+        try:
+            return name, "tag", mmap.mmap(-1, nbytes, tagname=name)
+        except Exception:
+            pass
+    path = os.path.join(tempfile.gettempdir(), name + ".shm")
+    with open(path, "wb") as f:
+        f.truncate(nbytes)
+    with open(path, "r+b") as f:
+        mm = mmap.mmap(f.fileno(), nbytes)
+    return path, "file", mm
+
+
+def shm_attach(name, mode, nbytes):
+    if mode == "tag":
+        return mmap.mmap(-1, nbytes, tagname=name)
+    with open(name, "r+b") as f:
+        return mmap.mmap(f.fileno(), nbytes)
+
+
+# ========================================================= search options
+opt_rfp = True        # reverse futility pruning
+opt_null_plus = True  # adaptive null move, only when eval >= beta
+opt_futility = True   # futility pruning of quiet moves
+opt_lmp = True        # late move pruning
+opt_lmr_plus = True   # log-table late move reductions
+opt_see = True        # SEE ordering + pruning
+opt_delta = False     # delta pruning in quiescence (off: tested -40 Elo in C)
+opt_iir = True        # internal iterative reduction
+opt_ordering = True   # counter-moves + history gravity/malus
+opt_qs_tt = True      # TT in quiescence            (V3)
+opt_tt_eval = True    # TT score refines prune eval (V3)
+opt_fifty = True      # 50-move eval scaling         (V3)
+
+LMR = [[0 if (d < 1 or m < 1) else int(0.75 + math.log(d) * math.log(m) / 2.25)
+        for m in range(64)] for d in range(64)]
+
+SCORE_TT = 3000000
+SCORE_GOODCAP = 2000000
+SCORE_QPROMO = 1900000
+SCORE_KILLER1 = 800000
+SCORE_KILLER2 = 700000
+SCORE_COUNTER = 600000
+SCORE_BADCAP = -1000000
+SCORE_UNDERPRO = -1500000
+HIST_MAX = 16384
+
+# --------------------------------------------------------------- GUI input
+_inq = queue.Queue()
+_pending = collections.deque()
+_quit = [False]
+
+
+def _reader():
+    while True:
+        line = sys.stdin.readline()
+        if not line:
+            _inq.put(None)
+            return
+        _inq.put(line)
+
+
+def poll_input():
+    """Handle commands that arrived during a search. True = stop."""
+    stop = False
+    while True:
+        try:
+            line = _inq.get_nowait()
+        except queue.Empty:
+            return stop
+        if line is None:
+            _quit[0] = True
+            return True
+        cmd = line.strip()
+        if cmd == "stop":
+            stop = True
+        elif cmd == "quit":
+            _quit[0] = True
+            stop = True
+        elif cmd == "isready":
+            out("readyok")
+        elif cmd:
+            _pending.append(cmd)
+
+
+def now_ms():
+    return time.perf_counter() * 1000.0
+
+
+# =================================================================== search
+
+class Search(object):
+    def __init__(self):
+        self.killers = [[0, 0] for _ in range(MAX_PLY + 2)]
+        self.history = [0] * (14 * 120)
+        self.counter = [0] * (14 * 120)
+        self.pv = [[0] * MAX_PLY for _ in range(MAX_PLY)]
+        self.pvlen = [0] * MAX_PLY
+        self.eval_stack = [EVAL_NONE] * (MAX_PLY + 4)
+        self.nodes = 0
+        self.stopped = False
+        self.start = 0.0
+        self.time_limit = 0
+        self.node_limit = 0
+        self.depth = MAX_PLY - 1
+        self.silent = False
+        self.hid = 0          # helper number (0 = main process)
+        self.sid = 0          # shared search id a helper is working on
+        self.start_depth = 1
+
+    def total_nodes(self):
+        """Nodes of this process plus all helpers (main process only)."""
+        n = self.nodes
+        if sh_mv is not None and self.hid == 0:
+            for k in range(1, len(helpers) + 1):
+                n += sh_mv[1 + k]
+        return n
+
+    def check_up(self):
+        if self.stopped:
+            return True
+        if self.hid:                          # helper: report nodes, obey main
+            sh_mv[1 + self.hid] = self.nodes
+            if sh_mv[0] != self.sid:
+                self.stopped = True
+            return self.stopped
+        if self.time_limit > 0 and now_ms() - self.start >= self.time_limit:
+            self.stopped = True
+        elif self.node_limit > 0 and self.total_nodes() >= self.node_limit:
+            self.stopped = True
+        elif not self.silent and poll_input():
+            self.stopped = True
+        return self.stopped
+
+    # -------------------------------------------------------------- ordering
+    def score_move(self, bd, m, tt_move, ply, cm):
+        if m == tt_move:
+            return SCORE_TT if (opt_see or opt_ordering) else 2000000
+        ty = m & 15
+        b = bd.b
+        if IS_CAP[ty]:
+            victim = wP if ty == EP_CAPTURE else b[(m >> 4) & 127]
+            attacker = b[(m >> 11) & 127]
+            vv = PIECE_VALUE[victim]
+            mvv = vv * 10 - PIECE_VALUE[attacker]
+            if not opt_see:
+                return 1000000 + mvv
+            if ty == QUEEN_PROMO_CAP:
+                return SCORE_GOODCAP + 9000 + mvv
+            # victim worth at least the attacker -> SEE can never be negative
+            if vv >= PIECE_VALUE[attacker] or see(bd, m) >= 0:
+                return SCORE_GOODCAP + mvv
+            return SCORE_BADCAP + mvv
+        if ty >= KNIGHT_PROMO:
+            if not opt_see and not opt_ordering:
+                return 900000
+            return SCORE_QPROMO if (ty & 3) == 3 else SCORE_UNDERPRO
+        k = self.killers[ply]
+        if m == k[0]:
+            return SCORE_KILLER1
+        if m == k[1]:
+            return SCORE_KILLER2
+        if opt_ordering and m and m == cm:
+            return SCORE_COUNTER
+        to = (m >> 4) & 127
+        return self.history[b[(m >> 11) & 127] * 120 + to]
+
+    # ------------------------------------------------------------ quiescence
+    def qsearch(self, bd, alpha, beta, ply):
+        if ply < MAX_PLY:
+            self.pvlen[ply] = ply
+        if (self.nodes & 1023) == 0 and self.check_up():
+            return 0
+        self.nodes += 1
+        alpha_orig = alpha
+
+        if opt_qs_tt and beta - alpha == 1:
+            te = tt_read(bd.hash)
+            if te is not None:
+                sc = score_from_tt(te[1], ply)
+                f = te[3]
+                if f == TT_EXACT:
+                    return sc
+                if f == TT_ALPHA and sc <= alpha:
+                    return alpha
+                if f == TT_BETA and sc >= beta:
+                    return beta
+
+        stand = evaluate(bd)
+        if stand >= beta:
+            return beta
+        if stand > alpha:
+            alpha = stand
+        if ply >= ACC_PLIES - 2:
+            return alpha
+
+        moves = gen_moves(bd, True)
+        n = len(moves)
+        scores = [self.score_move(bd, m, 0, 0, 0) for m in moves]
+        us = bd.stm
+        best_move = 0
+        b = bd.b
+
+        for i in range(n):
+            bi = i
+            bs = scores[i]
+            for j in range(i + 1, n):
+                if scores[j] > bs:
+                    bs = scores[j]
+                    bi = j
+            if bi != i:
+                moves.insert(i, moves.pop(bi))
+                scores.insert(i, scores.pop(bi))
+            m = moves[i]
+            ty = m & 15
+
+            if opt_see and bs < 0:          # only losing captures left
+                break
+
+            if opt_delta and ty < KNIGHT_PROMO:
+                victim = wP if ty == EP_CAPTURE else b[(m >> 4) & 127]
+                if stand + SEE_VAL[victim] + 200 <= alpha:
+                    continue
+
+            bd.make_move(m)
+            if attacked(b, bd.ksq[us], us ^ 1):
+                bd.undo_move()
+                continue
+            score = -self.qsearch(bd, -beta, -alpha, ply + 1)
+            bd.undo_move()
+            if self.stopped:
+                return 0
+            if score >= beta:
+                if opt_qs_tt:
+                    tt_store(bd.hash, 0, ply, beta, TT_BETA, m)
+                return beta
+            if score > alpha:
+                alpha = score
+                best_move = m
+
+        if opt_qs_tt:
+            tt_store(bd.hash, 0, ply, alpha,
+                     TT_EXACT if alpha > alpha_orig else TT_ALPHA, best_move)
+        return alpha
+
+    # ------------------------------------------------------------ alphabeta
+    def alphabeta(self, bd, depth, ply, alpha, beta, allow_null):
+        is_pv = beta - alpha > 1
+        if ply < MAX_PLY:
+            self.pvlen[ply] = ply             # no stale PV from a sibling
+        if (self.nodes & 1023) == 0 and self.check_up():
+            return 0
+
+        tt_move = 0
+        tt_hit = False
+        tt_sc = 0
+        te = None
+        if ply > 0:
+            if bd.fifty >= 100 or bd.is_rep() or bd.insufficient():
+                return 0
+            # mate distance pruning
+            if alpha < -MATE + ply:
+                alpha = -MATE + ply
+            if beta > MATE - ply - 1:
+                beta = MATE - ply - 1
+            if alpha >= beta:
+                return alpha
+            te = tt_read(bd.hash)
+            if te is not None:
+                tt_hit = True
+                tt_move = te[0]
+                tt_sc = score_from_tt(te[1], ply)
+                if not is_pv and te[2] > 0 and te[2] >= depth:
+                    f = te[3]
+                    if f == TT_EXACT:
+                        return tt_sc
+                    if f == TT_ALPHA and tt_sc <= alpha:
+                        return alpha
+                    if f == TT_BETA and tt_sc >= beta:
+                        return beta
+        alpha_orig = alpha
+
+        b = bd.b
+        us = bd.stm
+        checked = attacked(b, bd.ksq[us], us ^ 1)
+        if checked:
+            depth += 1
+        if depth <= 0:
+            return self.qsearch(bd, alpha, beta, ply)
+
+        self.nodes += 1
+        if ply > MAX_PLY - 2:
+            return evaluate(bd)
+
+        # static eval; "improving" = better than 2 plies ago
+        static_eval = EVAL_NONE
+        improving = False
+        es = self.eval_stack
+        if not checked and (opt_rfp or opt_null_plus or opt_futility or opt_lmp or opt_lmr_plus):
+            static_eval = evaluate(bd)
+            improving = ply >= 2 and es[ply - 2] != EVAL_NONE and static_eval > es[ply - 2]
+        es[ply] = static_eval
+
+        # TT score is a better guess than the raw eval when its bound agrees
+        prune_eval = static_eval
+        if (opt_tt_eval and tt_hit and static_eval != EVAL_NONE
+                and -MATE_BOUND < tt_sc < MATE_BOUND):
+            f = te[3]
+            if (f == TT_EXACT or (f == TT_BETA and tt_sc > static_eval)
+                    or (f == TT_ALPHA and tt_sc < static_eval)):
+                prune_eval = tt_sc
+
+        # reverse futility pruning
+        if (opt_rfp and not is_pv and not checked and ply > 0 and depth <= 7
+                and -MATE_BOUND < beta < MATE_BOUND
+                and prune_eval - (80 * depth - (40 if improving else 0)) >= beta):
+            return prune_eval
+
+        # null move
+        if (not is_pv and not checked and depth >= 3 and ply > 0 and bd.has_npm(us)
+                and (not opt_null_plus or (allow_null and prune_eval >= beta))):
+            if opt_null_plus:
+                R = 3 + depth // 4 + min((prune_eval - beta) // 200, 3)
+            else:
+                R = 2 + (1 if depth > 6 else 0)
+            bd.make_null()
+            ns = -self.alphabeta(bd, depth - 1 - R, ply + 1, -beta, -beta + 1, False)
+            bd.undo_null()
+            if self.stopped:
+                return 0
+            if ns >= beta and ns < MATE_BOUND:
+                return beta
+
+        # internal iterative reduction
+        if opt_iir and depth >= 4 and not tt_move:
+            depth -= 1
+
+        # counter-move
+        cm = 0
+        if opt_ordering and bd.undo:
+            prev = bd.undo[-1][0]
+            if prev:
+                pto = (prev >> 4) & 127
+                cm = self.counter[b[pto] * 120 + pto]
+
+        moves = gen_moves(bd, False)
+        n = len(moves)
+        scores = [self.score_move(bd, m, tt_move, ply, cm) for m in moves]
+        killers = self.killers[ply]
+        hist = self.history
+        legal = 0
+        searched = 0
+        best = -INF
+        best_move = 0
+        quiets = []
+
+        for i in range(n):
+            bi = i
+            bs = scores[i]
+            for j in range(i + 1, n):
+                if scores[j] > bs:
+                    bs = scores[j]
+                    bi = j
+            if bi != i:
+                moves.insert(i, moves.pop(bi))
+                scores.insert(i, scores.pop(bi))
+            m = moves[i]
+            ty = m & 15
+            quiet = not IS_CAP[ty] and ty < KNIGHT_PROMO
+            is_killer = m == killers[0] or m == killers[1]
+            to = (m >> 4) & 127
+            mpiece = b[(m >> 11) & 127]
+
+            # SEE pruning of clearly losing captures near the leaves
+            if (opt_see and not is_pv and not checked and searched > 0 and best > -MATE_BOUND
+                    and depth <= 6 and IS_CAP[ty] and bs < 0 and see(bd, m) < -100 * depth):
+                continue
+
+            bd.make_move(m)
+            if attacked(b, bd.ksq[us], us ^ 1):
+                bd.undo_move()
+                continue
+            legal += 1
+            gives_check = attacked(b, bd.ksq[us ^ 1], us)
+
+            # prune hopeless quiet moves once one move has been searched
+            if (ply > 0 and quiet and not checked and not gives_check
+                    and searched > 0 and best > -MATE_BOUND):
+                if (opt_lmp and depth <= 7
+                        and len(quiets) >= (3 + depth * depth) // (1 if improving else 2)):
+                    bd.undo_move()
+                    continue
+                if (opt_futility and depth <= 6 and not is_killer and static_eval != EVAL_NONE
+                        and prune_eval + 110 + 100 * depth <= alpha):
+                    bd.undo_move()
+                    continue
+
+            searched += 1
+            if quiet:
+                quiets.append(m)
+            new_depth = depth - 1
+
+            if searched == 1:
+                score = -self.alphabeta(bd, new_depth, ply + 1, -beta, -alpha, True)
+            else:
+                red = 0
+                if opt_lmr_plus:
+                    if depth >= 3 and not checked and (quiet or bs < 0):
+                        hv = hist[mpiece * 120 + to] if quiet else 0
+                        red = LMR[depth if depth < 64 else 63][searched if searched < 64 else 63]
+                        if is_pv:
+                            red -= 1
+                        if is_killer or (cm and m == cm):
+                            red -= 1
+                        if gives_check:
+                            red -= 1
+                        if not improving:
+                            red += 1
+                        red -= tdiv(hv, 6000)
+                        if red < 0:
+                            red = 0
+                        if red > new_depth - 1:
+                            red = new_depth - 1
+                elif depth >= 3 and searched > 3 and quiet and not checked and not gives_check:
+                    red = 1                                    # V1
+                    if searched > 6:
+                        red += 1
+                    if depth > 6 and searched > 10:
+                        red += 1
+                    if red > new_depth - 1:
+                        red = new_depth - 1
+
+                score = -self.alphabeta(bd, new_depth - red, ply + 1, -alpha - 1, -alpha, True)
+                if score > alpha and red > 0:
+                    score = -self.alphabeta(bd, new_depth, ply + 1, -alpha - 1, -alpha, True)
+                if alpha < score < beta:
+                    score = -self.alphabeta(bd, new_depth, ply + 1, -beta, -alpha, True)
+
+            bd.undo_move()
+            if self.stopped:
+                return 0
+
+            if score > best:
+                best = score
+                best_move = m
+            if score > alpha:
+                alpha = score
+                if ply < MAX_PLY - 1:
+                    pvp = self.pv[ply]
+                    pvc = self.pv[ply + 1]
+                    L = self.pvlen[ply + 1]
+                    pvp[ply] = m
+                    for j in range(ply + 1, L):
+                        pvp[j] = pvc[j]
+                    self.pvlen[ply] = L
+                if alpha >= beta:
+                    if quiet:
+                        killers[1] = killers[0]
+                        killers[0] = m
+                        if opt_ordering:
+                            bonus = depth * depth if depth * depth < 1200 else 1200
+                            k = mpiece * 120 + to
+                            hist[k] += bonus - tdiv(hist[k] * bonus, HIST_MAX)
+                            for q in quiets[:-1]:              # tried before, failed
+                                k = b[(q >> 11) & 127] * 120 + ((q >> 4) & 127)
+                                hist[k] += -bonus - tdiv(hist[k] * bonus, HIST_MAX)
+                            if bd.undo and bd.undo[-1][0]:
+                                prev = bd.undo[-1][0]
+                                pto = (prev >> 4) & 127
+                                self.counter[b[pto] * 120 + pto] = m
+                        else:
+                            hist[mpiece * 120 + to] += depth * depth    # V1
+                    tt_store(bd.hash, depth, ply, beta, TT_BETA, m)
+                    return beta
+
+        if legal == 0:
+            return (-MATE + ply) if checked else 0
+        if searched == 0:
+            return alpha
+        tt_store(bd.hash, depth, ply, best,
+                 TT_EXACT if alpha > alpha_orig else TT_ALPHA, best_move)
+        return best
+
+    # ---------------------------------------------------------- root search
+    def think(self, bd):
+        self.nodes = 0
+        self.stopped = False
+        self.killers = [[0, 0] for _ in range(MAX_PLY + 2)]
+        self.history = [0] * (14 * 120)
+        self.counter = [0] * (14 * 120)
+        self.eval_stack[0] = EVAL_NONE
+        acc_setup(bd)
+
+        root = gen_legal(bd)
+        if not root:
+            bd.acc = None
+            return 0
+        best_move = root[0]
+        prev_score = 0
+        last_pv = []
+
+        for d in range(min(self.start_depth, self.depth), self.depth + 1):
+            window = 35
+            if d >= 4 and -MATE_BOUND < prev_score < MATE_BOUND:
+                alpha = prev_score - window
+                beta = prev_score + window
+            else:
+                alpha = -INF
+                beta = INF
+
+            iter_best = 0
+            best_score = -INF
+            best_pv = []
+            while True:
+                cur_alpha = alpha
+                iter_best = 0
+                best_score = -INF
+                best_pv = []
+                sc = [self.score_move(bd, m, best_move, 0, 0) for m in root]
+                order = sorted(range(len(root)), key=lambda k: -sc[k])   # stable
+                root = [root[k] for k in order]
+
+                for i, m in enumerate(root):
+                    if not self.silent and now_ms() - self.start > 1000.0:
+                        out("info depth %d currmove %s currmovenumber %d"
+                            % (d, move_to_str(m), i + 1))
+                    bd.make_move(m)
+                    score = -self.alphabeta(bd, d - 1, 1, -beta, -cur_alpha, True)
+                    bd.undo_move()
+                    if self.stopped:
+                        break
+                    if score > best_score:
+                        best_score = score
+                        iter_best = m
+                        best_pv = [m] + self.pv[1][1:self.pvlen[1]]
+                    if score > cur_alpha:
+                        cur_alpha = score
+
+                if self.stopped:
+                    break
+                if best_score <= alpha:
+                    window *= 3
+                    alpha = max(best_score - window, -INF)
+                    continue
+                if best_score >= beta:
+                    window *= 3
+                    beta = min(best_score + window, INF)
+                    continue
+                break
+
+            if self.stopped and iter_best == 0:
+                break
+            if iter_best:
+                best_move = iter_best
+            prev_score = best_score
+
+            ms = now_ms() - self.start
+            if not self.silent:
+                if best_pv:
+                    last_pv = best_pv
+                if best_score > MATE_BOUND:
+                    sc_str = "mate %d" % ((MATE - best_score + 1) // 2)
+                elif best_score < -MATE_BOUND:
+                    sc_str = "mate %d" % (-((MATE + best_score + 1) // 2))
+                else:
+                    sc_str = "cp %d" % best_score
+                nodes = self.total_nodes()
+                nps = int(nodes / (ms / 1000.0 + 0.001))
+                out("info depth %d score %s nodes %d nps %d time %d hashfull %d pv %s"
+                    % (d, sc_str, nodes, nps, int(ms), tt_hashfull(),
+                       " ".join(move_to_str(x) for x in last_pv)))
+            if best_score > MATE_BOUND:
+                break
+            if self.stopped:
+                break
+            if self.time_limit > 0 and ms > self.time_limit * 0.5:
+                break
+
+        bd.acc = None
+        return best_move
+
+
+# ====================================================================== UCI
+
+BENCH_FENS = [
+    "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+    "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+    "r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4",
+    "r1bq1rk1/pp2ppbp/2np1np1/8/3NP3/2N1BP2/PPPQ2PP/R3KB1R w KQ - 1 9",
+    "2rq1rk1/pp1bppbp/3p1np1/4n3/3NP2P/1BN1BP2/PPPQ2P1/2KR3R w - - 1 13",
+    "r2q1rk1/1b2bppp/p2ppn2/1p6/3BPP2/2NB4/PPPQ2PP/2KR3R w - - 0 13",
+    "rnbq1rk1/ppp1ppbp/3p1np1/8/2PPP3/2N2N2/PP2BPPP/R1BQK2R b KQ - 3 6",
+    "r1b2rk1/2q1bppp/p2p1n2/np2p3/3PP3/5N1P/PPBN1PP1/R1BQR1K1 w - - 0 13",
+    "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+    "6k1/5ppp/8/8/8/2B5/5PPP/3R2K1 w - - 0 1",
+    "8/8/3k4/3p4/3P4/2K5/8/8 w - - 0 1",
+    "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10",
+    "4rrk1/pp1n3p/3q2pQ/2p1pb2/2PP4/2P3N1/P2B2PP/4RRK1 b - - 7 19",
+    "3r1rk1/p5pp/bpp1pp2/8/q1PP1P2/b3P3/P2NQRPP/1R2B1K1 b - - 6 22",
+]
+
+
+def run_bench(bd, depth):
+    global g_age
+    depth = max(1, min(depth, MAX_PLY - 1))
+    ensure_net()
+    total = 0
+    ms = 0.0
+    for i, fen in enumerate(BENCH_FENS):
+        bd.parse_fen(fen)
+        tt_clear()
+        eval_cache_clear()
+        s = Search()
+        s.depth = depth
+        s.silent = True
+        s.start = now_ms()
+        g_age += 1
+        bm = s.think(bd)
+        ms += now_ms() - s.start
+        out("bench %2d  %-6s nodes %d" % (i + 1, move_to_str(bm) if bm else "0000", s.nodes))
+        total += s.nodes
+    out("bench depth %d: %d nodes  %.0f ms  %d nps"
+        % (depth, total, ms, int(total / (ms / 1000.0 + 0.001))))
+    bd.parse_fen(START_FEN)
+    tt_clear()
+    eval_cache_clear()
+
+
+def print_eval(bd):
+    ensure_net()
+    sgn = 1 if bd.stm == WHITE else -1
+    if nn_loaded:
+        acc_setup(bd)
+        v = eval_net(bd)
+        bd.acc = None
+        out("info string eval (White's view): %d cp   net %s (768 -> %dx2 -> 1)"
+            % (sgn * v, nn_path, nn_H))
+    else:
+        out("info string eval (White's view): %d cp   material only, no net loaded"
+            % (sgn * eval_material(bd)))
+
+
+# --------------------------------------------------------- helper processes
+MAX_THREADS = 4
+g_threads = 1
+g_hash_mb = TT_DEFAULT_MB
+helpers = []            # subprocess.Popen of helper 1..3
+helpers_dirty = True    # Threads / Hash changed -> rebuild before next search
+g_sid = 0               # last shared search id handed out
+
+
+def helpers_send(line):
+    for p in helpers:
+        try:
+            p.stdin.write(line + "\n")
+            p.stdin.flush()
+        except Exception:
+            pass
+
+
+def helpers_stop():
+    """Stop all helpers and drop the shared hash table."""
+    global sh_info
+    if sh_mv is not None:
+        sh_mv[0] = 0
+    helpers_send("quit")
+    for p in helpers:
+        try:
+            p.wait(timeout=3)
+        except Exception:
+            try:
+                p.kill()
+            except Exception:
+                pass
+    del helpers[:]
+    info = sh_info
+    use_shared_tt(None, 0)
+    sh_info = None
+    if info and info[1] == "file":
+        try:
+            os.remove(info[0])
+        except OSError:
+            pass
+
+
+def helpers_ensure():
+    """Make the helper set match the Threads option (called at isready/go)."""
+    global helpers_dirty, sh_info
+    if not helpers_dirty:
+        return
+    helpers_dirty = False
+    helpers_stop()
+    if g_threads <= 1:
+        tt_resize(g_hash_mb)
+        return
+    tt_resize(1)                                  # list TT unused while shared
+    entries = 1
+    while entries * 2 * 16 <= g_hash_mb * 1024 * 1024:
+        entries *= 2
+    nbytes = (SH_HDR + 2 * entries) * 8
+    try:
+        name, mode, mm = shm_create(nbytes)
+    except Exception as e:
+        out("info string Processes: shared memory failed (%s) -- running 1 process" % e)
+        tt_resize(g_hash_mb)
+        return
+    use_shared_tt(mm, entries)
+    sh_info = (name, mode, nbytes, entries)
+    script = os.path.abspath(__file__)
+    flags = 0x08000000 if os.name == "nt" else 0       # CREATE_NO_WINDOW
+    try:                                               # helper errors land here
+        log = open(os.path.join(os.path.dirname(script), "CLCENnetPy_helpers.log"), "w")
+    except OSError:
+        log = subprocess.DEVNULL
+    for k in range(1, g_threads):
+        try:
+            p = subprocess.Popen(
+                [sys.executable, script, "--helper", name, mode, str(nbytes), str(entries), str(k)],
+                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=log,
+                universal_newlines=True, bufsize=1, creationflags=flags)
+        except Exception as e:
+            out("info string Processes: could not start helper %d (%s)" % (k, e))
+            break
+        helpers.append(p)
+    # helpers get the same net and search options as the main process
+    helpers_send("setoption name NetFile value %s" % nn_path)
+    for uci_name, var in CHECK_OPTS:
+        helpers_send("setoption name %s value %s"
+                     % (uci_name, "true" if globals()[var] else "false"))
+    out("info string Processes: %d (main + %d helper%s), shared hash %d MB"
+        % (len(helpers) + 1, len(helpers), "" if len(helpers) == 1 else "s",
+           (nbytes >> 20)))
+
+
+def set_position(bd, tok):
+    """Returns the moves played from the start position, or None for a FEN."""
+    played = None
+    if "fen" in tok:
+        fi = tok.index("fen")
+        mi = tok.index("moves") if "moves" in tok else len(tok)
+        fen = " ".join(tok[fi + 1:mi])
+        bd.parse_fen(fen)
+        if fen.split()[:4] == START_FEN.split()[:4]:
+            played = []
+    else:
+        bd.parse_fen(START_FEN)
+        played = []
+    if "moves" in tok:
+        for ms in tok[tok.index("moves") + 1:]:
+            m = str_to_move(bd, ms)
+            if not m:
+                break
+            bd.make_move(m)
+            if played is not None:
+                played.append(m)
+    return played
+
+
+# ============================================================= opening book
+# book.txt: one game line per row in SAN from the start position, e.g.
+#   d4 Nf6 c4 e6 Nf3 b6 g3 Ba6 ...
+# Lines starting with '#' are comments. At every move the engine keeps the
+# lines whose first moves match the game so far, picks one of them at
+# random and plays its next move (more lines through a move = more likely).
+# The first time the game leaves the book it stops looking until the next
+# game, so it costs nothing after the opening.
+opt_own_book = True
+book_path = "book.txt"
+book_lines = None        # list of tuples of SAN tokens
+book_tried = False
+book_out = False         # left the book this game
+
+
+def book_load():
+    global book_lines, book_tried
+    book_tried = True
+    book_lines = None
+    full = resolve_path(book_path)
+    try:
+        with open(full, "r", encoding="utf-8", errors="replace") as f:
+            lines = []
+            for row in f:
+                row = row.strip()
+                if not row or row[0] == "#":
+                    continue
+                toks = []
+                for t in row.split():
+                    if t[0].isdigit() and "." in t:          # "1." / "12..." numbers
+                        t = t[t.rindex(".") + 1:]
+                        if not t:
+                            continue
+                    if t in ("1-0", "0-1", "1/2-1/2", "*"):
+                        break
+                    toks.append(t)
+                if toks:
+                    lines.append(tuple(toks))
+    except (IOError, OSError):
+        out("info string Book: cannot open %s -- playing without a book" % book_path)
+        return
+    book_lines = lines
+    out("info string Book: loaded %s (%d lines)" % (book_path, len(lines)))
+
+
+def san_to_move(bd, san):
+    """SAN (e.g. Nf3, exd5, O-O, e8=Q, Rad1, Qh4xe1+) -> legal move, or 0."""
+    s = san.rstrip("+#!?")
+    if s in ("O-O", "0-0", "O-O-O", "0-0-0"):
+        want = KING_CASTLE if s in ("O-O", "0-0") else QUEEN_CASTLE
+        for m in gen_legal(bd):
+            if (m & 15) == want:
+                return m
+        return 0
+    promo = -1
+    if "=" in s:
+        s, p = s.split("=", 1)
+        promo = "NBRQ".find(p[:1].upper())
+    elif len(s) >= 3 and s[-1] in "NBRQ" and s[-2] in "18":
+        promo = "NBRQ".find(s[-1])
+        s = s[:-1]
+    if len(s) < 2:
+        return 0
+    if s[0] in "NBRQK":
+        ptype = "PNBRQK".index(s[0]) + 1
+        body = s[1:]
+    else:
+        ptype = PAWN
+        body = s
+    to = str_to_sq(body[-2:])
+    if to < 0:
+        return 0
+    dis = body[:-2].replace("x", "")
+    dfile = drank = -1
+    for ch in dis:
+        if "a" <= ch <= "h":
+            dfile = ord(ch) - 97
+        elif "1" <= ch <= "8":
+            drank = ord(ch) - 49
+    b = bd.b
+    found = 0
+    for m in gen_legal(bd):
+        if ((m >> 4) & 127) != to:
+            continue
+        frm = (m >> 11) & 127
+        if BASE[b[frm]] != ptype:
+            continue
+        if dfile >= 0 and (frm % 10) - 1 != dfile:
+            continue
+        if drank >= 0 and RANK[frm] != drank:
+            continue
+        ty = m & 15
+        if ty >= KNIGHT_PROMO:
+            if (ty & 3) != (promo if promo >= 0 else 3):
+                continue
+        elif promo >= 0:
+            continue
+        if found:
+            return 0                                     # ambiguous SAN
+        found = m
+    return found
+
+
+def book_new_game():
+    global book_out
+    book_out = False
+
+
+def book_move(played):
+    """Random book move for the game `played` (moves from the start), or 0."""
+    global book_out
+    if not opt_own_book or book_out or played is None:
+        return 0
+    if not book_tried:
+        book_load()
+    if not book_lines:
+        return 0
+    n = len(played)
+    bd = Board()                                         # replay from the start
+    cand = [ln for ln in book_lines if len(ln) > n]
+    for i in range(n):
+        groups = {}
+        for ln in cand:
+            groups.setdefault(ln[i], []).append(ln)
+        keep = []
+        for tok, lns in groups.items():
+            if san_to_move(bd, tok) == played[i]:
+                keep.extend(lns)
+        cand = keep
+        if not cand:
+            break
+        bd.make_move(played[i])
+    if not cand:
+        book_out = True
+        return 0
+    import random
+    order = list(cand)
+    random.shuffle(order)
+    tried = set()
+    for ln in order:                                     # first line whose move is legal
+        tok = ln[n]
+        if tok in tried:
+            continue
+        tried.add(tok)
+        m = san_to_move(bd, tok)
+        if m:
+            return m
+    book_out = True
+    return 0
+
+
+def helper_main(argv):
+    try:
+        _helper_loop(argv)
+    except Exception:
+        import traceback
+        sys.stderr.write("helper %s crashed:\n" % (argv[4] if len(argv) > 4 else "?"))
+        traceback.print_exc()
+        sys.stderr.flush()
+
+
+def helpers_report(main_nodes):
+    """After a search: per-process node counts, and any helper that died."""
+    if not helpers:
+        return
+    parts = ["main %d" % main_nodes]
+    for k, p in enumerate(helpers, 1):
+        if p.poll() is not None:
+            parts.append("h%d DEAD (see CLCENnetPy_helpers.log)" % k)
+        else:
+            parts.append("h%d %d" % (k, sh_mv[1 + k]))
+    out("info string Processes nodes: " + " | ".join(parts))
+
+
+def _helper_loop(argv):
+    """--helper NAME MODE NBYTES ENTRIES ID: search silently into the shared TT."""
+    global g_age
+    name, mode, nbytes, entries, hid = argv[0], argv[1], int(argv[2]), int(argv[3]), int(argv[4])
+    use_shared_tt(shm_attach(name, mode, nbytes), entries)
+    sys.stderr.write("helper %d started (%s)\n" % (hid, sys.executable))
+    sys.stderr.flush()
+    bd = Board()
+    while True:
+        line = sys.stdin.readline()
+        if not line:
+            break                                 # main process is gone
+        tok = line.split()
+        if not tok:
+            continue
+        cmd = tok[0]
+        if cmd == "quit":
+            break
+        elif cmd == "setoption":
+            low = line.lower()
+            if "name hash" not in low and "name processes" not in low and "name threads" not in low:
+                handle_setoption(line.strip(), helper=True)
+        elif cmd == "ucinewgame":
+            eval_cache_clear()
+        elif cmd == "position":
+            set_position(bd, tok)
+        elif cmd == "go" and len(tok) >= 3:
+            sid, age = int(tok[1]), int(tok[2])
+            if sh_mv[0] != sid:
+                continue                          # that search is already over
+            g_age = age
+            s = Search()
+            s.silent = True
+            s.hid = hid
+            s.sid = sid
+            s.start_depth = 2 if hid & 1 else 1   # spread helpers over depths
+            s.start = now_ms()
+            s.think(bd)
+            sh_mv[1 + hid] = s.nodes
+
+
+CHECK_OPTS = [
+    ("RFP", "opt_rfp"), ("NullMove+", "opt_null_plus"), ("Futility", "opt_futility"),
+    ("LMP", "opt_lmp"), ("LMR+", "opt_lmr_plus"), ("SEE", "opt_see"),
+    ("Delta", "opt_delta"), ("IIR", "opt_iir"), ("Ordering+", "opt_ordering"),
+    ("QSearchTT", "opt_qs_tt"), ("TTEval", "opt_tt_eval"), ("Fifty", "opt_fifty"),
+]
+
+
+def handle_setoption(line, helper=False):
+    global nn_path, net_tried, g_threads, g_hash_mb, helpers_dirty, opt_own_book, book_path
+    low = line.lower()
+    ni = low.find("name ")
+    if ni < 0:
+        return
+    vi = low.find(" value ")
+    if vi >= 0:
+        name = line[ni + 5:vi].strip()
+        value = line[vi + 7:].strip()
+    else:
+        name = line[ni + 5:].strip()
+        value = ""
+    lname = name.lower()
+
+    if lname == "hash":
+        try:
+            mb = int(value)
+            if mb > 0:
+                g_hash_mb = max(1, min(mb, TT_MAX_MB))
+                if g_threads > 1 or sh_mv is not None:
+                    helpers_dirty = True          # rebuilt at the next isready/go
+                else:
+                    tt_resize(g_hash_mb)
+        except ValueError:
+            pass
+        return
+    if lname == "processes" or lname == "threads":   # Threads kept for other GUIs
+        try:
+            t = max(1, min(int(value), MAX_THREADS))
+        except ValueError:
+            return
+        if t != g_threads:
+            g_threads = t
+            helpers_dirty = True
+        return
+    if lname == "ownbook":
+        opt_own_book = value.lower() == "true"
+        return
+    if lname == "bookfile":
+        if value and value != "<empty>":
+            book_path = value
+            book_load()
+        return
+    if lname == "netfile":
+        if value and value != "<empty>":
+            nn_path = value
+            nn_free()
+            net_tried = False
+            if not helper:
+                tt_clear()                        # old scores came from another net
+            eval_cache_clear()
+            ensure_net()
+            if not helper:
+                helpers_send(line)
+        return
+    for uci_name, var in CHECK_OPTS:
+        if lname == uci_name.lower():
+            globals()[var] = value.lower() == "true"
+            if not helper:
+                helpers_send(line)
+            return
+
+
+def uci_loop(bd):
+    global g_age, g_sid
+    last_pos = "position startpos"
+    played = []
+    while True:
+        if _pending:
+            line = _pending.popleft()
+        else:
+            raw = _inq.get()
+            if raw is None:
+                break
+            line = raw.strip()
+        if not line:
+            continue
+        tok = line.split()
+        cmd = tok[0]
+
+        if cmd == "uci":
+            out("id name %s" % ENGINE_NAME)
+            out("id author %s" % ENGINE_AUTHOR)
+            out("option name Hash type spin default %d min 1 max %d" % (TT_DEFAULT_MB, TT_MAX_MB))
+            out("option name Processes type spin default 1 min 1 max %d" % MAX_THREADS)
+            out("option name NetFile type string default %s" % nn_path)
+            out("option name OwnBook type check default %s" % ("true" if opt_own_book else "false"))
+            out("option name BookFile type string default %s" % book_path)
+            for uci_name, var in CHECK_OPTS:
+                out("option name %s type check default %s"
+                    % (uci_name, "true" if globals()[var] else "false"))
+            out("uciok")
+        elif cmd == "isready":
+            ensure_net()
+            helpers_ensure()
+            out("readyok")
+        elif cmd == "setoption":
+            handle_setoption(line)
+        elif cmd == "ucinewgame":
+            bd.parse_fen(START_FEN)
+            last_pos = "position startpos"
+            played = []
+            book_new_game()
+            tt_clear()
+            eval_cache_clear()
+            helpers_send("ucinewgame")
+        elif cmd == "eval":
+            print_eval(bd)
+        elif cmd == "bench":
+            d = 6
+            if len(tok) > 1 and tok[1].isdigit():
+                d = int(tok[1])
+            run_bench(bd, d)
+        elif cmd == "perft":
+            d = int(tok[1]) if len(tok) > 1 and tok[1].isdigit() else 1
+            for i in range(1, d + 1):
+                t0 = now_ms()
+                n = perft(bd, i)
+                out("perft %d : %d nodes  (%.0f ms)" % (i, n, now_ms() - t0))
+        elif cmd == "position":
+            played = set_position(bd, tok)
+            last_pos = line
+        elif cmd == "go":
+            ensure_net()
+            helpers_ensure()
+            bm = book_move(played)
+            if bm:
+                out("info string Book move %s" % move_to_str(bm))
+                out("info depth 1 score cp 0 nodes 0 pv %s" % move_to_str(bm))
+                if "infinite" in tok:                   # GUI still expects "stop" first
+                    while True:
+                        raw = _inq.get()
+                        if raw is None or raw.strip() in ("stop", "quit"):
+                            if raw is None or raw.strip() == "quit":
+                                _quit[0] = True
+                            break
+                        if raw.strip() == "isready":
+                            out("readyok")
+                out("bestmove %s" % move_to_str(bm))
+                if _quit[0]:
+                    break
+                continue
+            s = Search()
+            vals = {}
+            infinite = "infinite" in tok
+            for k in ("depth", "movetime", "wtime", "btime", "winc", "binc", "movestogo", "nodes"):
+                if k in tok:
+                    i = tok.index(k)
+                    if i + 1 < len(tok):
+                        try:
+                            vals[k] = int(tok[i + 1])
+                        except ValueError:
+                            pass
+            s.depth = vals.get("depth", MAX_PLY - 1)
+            if s.depth < 1 or s.depth >= MAX_PLY:
+                s.depth = MAX_PLY - 1
+            s.time_limit = vals.get("movetime", 0)
+            s.node_limit = vals.get("nodes", 0)
+            if s.time_limit == 0 and ("wtime" in vals or "btime" in vals):
+                mytime = vals.get("wtime" if bd.stm == WHITE else "btime", 0)
+                myinc = vals.get("winc" if bd.stm == WHITE else "binc", 0)
+                mtg = vals.get("movestogo", 30)
+                if mtg < 1:
+                    mtg = 30
+                tl = mytime // mtg + myinc - 50          # Python: a bit more safety margin
+                if tl < 20:
+                    tl = 20
+                if tl > mytime // 2:
+                    tl = mytime // 2
+                s.time_limit = max(tl, 1)
+            g_age += 1
+            s.start = now_ms()
+            if helpers:                           # Lazy SMP: helpers join in
+                g_sid += 1
+                for k in range(1, MAX_THREADS + 1):
+                    sh_mv[k] = 0
+                sh_mv[0] = g_sid
+                helpers_send(last_pos)
+                helpers_send("go %d %d" % (g_sid, g_age))
+            bm = s.think(bd)
+
+            # UCI: in "go infinite" bestmove is sent only after "stop"
+            while infinite and not s.stopped and not _quit[0] and not _pending:
+                raw = _inq.get()
+                if raw is None:
+                    _quit[0] = True
+                    break
+                c = raw.strip()
+                if c == "stop":
+                    break
+                if c == "quit":
+                    _quit[0] = True
+                    break
+                if c == "isready":
+                    out("readyok")
+                elif c:
+                    _pending.append(c)
+
+            if sh_mv is not None:
+                sh_mv[0] = 0                      # helpers: stop
+                helpers_report(s.nodes)
+            out("bestmove %s" % (move_to_str(bm) if bm else "0000"))
+            if _quit[0]:
+                break
+        elif cmd == "quit":
+            break
+        # "stop" with no search running: nothing to do
+    helpers_stop()
+
+
+def main():
+    global nn_path
+    sys.setrecursionlimit(10000)
+
+    # CLCENnetPy.py --helper ...  -> Lazy SMP helper (started by the main engine)
+    if len(sys.argv) >= 7 and sys.argv[1] == "--helper":
+        tt_resize(1)
+        helper_main(sys.argv[2:7])
+        return
+
+    tt_resize(TT_DEFAULT_MB)
+    bd = Board()
+
+    # CLCENnetPy.py bench [depth] [net]  -> run bench and exit
+    if len(sys.argv) >= 2 and sys.argv[1] == "bench":
+        d = int(sys.argv[2]) if len(sys.argv) >= 3 else 6
+        if len(sys.argv) >= 4:
+            nn_path = sys.argv[3]
+        run_bench(bd, d)
+        return
+
+    th = threading.Thread(target=_reader)
+    th.daemon = True
+    th.start()
+    uci_loop(bd)
+
+
+if __name__ == "__main__":
+    main()
