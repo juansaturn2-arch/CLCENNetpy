@@ -193,7 +193,7 @@ These ratings come from K7's own testing on one machine. More games will narrow 
 - Nothing to install on Windows: PyPy3 is included in the `pypy` folder just extracted from zip file. (Python 3.8+ also works, but much slower.)
 - Standard library only.
 - Optional: MinGW64 `gcc` to build the launcher.
-
+- also if wanna just play the standalone without pypy or installing any python software, and straight into arena the engine is compile already into exe in 2100 elo engine folder but you have point out the net for it in the engine configuration either k726k.k7nn or k7net.bin which is also in the 2100 elo engine folder
 ## License / credits
 
 CLCENnetPy and the K7NN networks by **K7**, K7 ChessLab Collection.
