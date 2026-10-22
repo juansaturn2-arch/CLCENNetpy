@@ -1,6 +1,6 @@
 # CLCENnetPy v1.2
 
-**A pure-Python NNUE chess engine.** It uses only the Python standard library, with no NumPy and no pip installs. Run it under PyPy3 and it plays at roughly **2600 Elo** at 5+3 on a single core.
+**A pure-Python NNUE chess engine.** It uses only the Python standard library, with no NumPy and no pip installs. Run it under PyPy3 and it plays at about **2545 Elo** (± 40) at 5+3 on a single core.
 
 Author: **K7** (K7 ChessLab Collection)
 
@@ -14,8 +14,8 @@ CLCENnetPy is a Python port of **K7CustomNetV2** (C), plus a few cheap improveme
 |---|---|
 | `CLCENnetPy.py` | The engine (single file) |
 | `k7net26k.k7nn` | The default network |
-| `book.txt` | Opening book (688 lines, SAN text) |
-| `pypy/` | PyPy3 for Windows, included and ready to use |
+| `book.txt` | Opening book (653 lines, SAN text) |
+| `pypy.7z` | PyPy3 for Windows, included. **Extract it first** (see below) |
 | `CLCENnetPy.c` | Optional launcher source, builds `CLCENnetPy.exe` |
 | `pgn/` | Test games used for the rating estimate below |
 
@@ -23,9 +23,21 @@ CLCENnetPy is a Python port of **K7CustomNetV2** (C), plus a few cheap improveme
 
 ## Quick start
 
-### Option 1 — PyPy3 (recommended)
+### Step 1 — Extract PyPy (do this first!)
 
-PyPy3 for Windows is **already included** in the `pypy` folder, so there is nothing to install just extracted from the zip make sure folder is call pypy.
+PyPy3 for Windows is included as **`pypy.7z`**. Extract it with **7-Zip** or any program that can open `.7z` files.
+
+After extracting, the files **must be in a folder named `pypy`** next to the engine, so this file exists:
+
+```
+CLCENnetPy\pypy\pypy3.exe
+```
+
+Watch out for an extra folder level (for example `pypy\pypy\pypy3.exe` or `pypy-3.11\pypy3.exe`). If that happens, move the files up so `pypy3.exe` sits directly inside `pypy`.
+
+> **Why this matters:** if `pypy\pypy3.exe` is not found, the launcher falls back to a regular Python installed on the PC (if there is one), and the engine plays at only about **2100–2200 Elo**. With no Python installed either, the engine will not start and reports `launcher: no interpreter`. Set up correctly with PyPy, you get the full **~2545 Elo** engine, and **no Python install is needed**.
+
+### Option 1 — PyPy3 from the console (recommended)
 
 1. Open a command window in the engine folder.
 2. Run:
@@ -153,47 +165,58 @@ Lines starting with `#` are comments. Each move, the engine keeps the lines that
 
 ## Strength
 
-All games at **5 min + 3 s**, CLCENnetPy on **PyPy3, 1 process**, single-threaded opponents, Intel i9-9900K. Ratings fitted by maximum likelihood with the anchors fixed.
+**CLCENnetPy v1.2: about 2545 ± 40 Elo** (95% range 2505–2585).
 
-### Results against anchors
+Conditions: **5 min + 3 s**, CLCENnetPy on **PyPy3, 1 process**, single-threaded opponents, pondering off, Intel i9-9900K. Ratings fitted by maximum likelihood with the anchors fixed at their **CCRL 40/15** ratings.
 
-| Opponent | Anchor rating | Games | W | D | L | Score |
-|---|---|---|---|---|---|---|
-| Pawny 1.1 | 2700 (CCRL) | 15 | 7 | 2 | 6 | 53% |
-| CLMaster64 (Greko 2018 derivative) | ~2643 | 15 | 3 | 3 | 9 | 30% |
-| TheKing 3.50 (original) | 2700 (listed) | 15 | 0 | 2 | 13 | 7% |
+> 5+3 gives each engine about two-thirds of the thinking time of CCRL's 40/15, so this is a close approximation of a CCRL 40/15 rating, not an official one.
 
-### Estimate
+### Results against anchors (315 games)
+
+| Anchor | CCRL 40/15 | Games | W | D | L | Score | Performance |
+|---|---|---|---|---|---|---|---|
+| GreKo 2018.2 | 2643 | 75 | 18 | 14 | 43 | 33.3% | 2522 |
+| GreKo 2015 | 2599 | 75 | 21 | 15 | 39 | 38.0% | 2513 |
+| GreKo 13.1 | 2556 | 75 | 26 | 14 | 35 | 44.0% | 2514 |
+| GreKo 9.7 | 2522 | 75 | 38 | 13 | 24 | 59.3% | 2587 |
+| Pawny 1.1 | 2700 | 15 | 7 | 2 | 6 | 53.3% | 2723 |
+| **Total** | avg 2586 | **315** | 110 | 58 | 147 | **44.1%** | **2544** |
+
+The result barely changes with the choice of anchors:
 
 | Anchors used | Games | Rating | 95% range |
 |---|---|---|---|
-| Pawny + CLMaster | 30 | **~2610** | 2480–2740 |
-| Pawny + CLMaster + TheKing 3.50 | 45 | ~2530 | 2420–2640 |
+| **4 GreKo + Pawny** | **315** | **2544** | **2504–2583** |
+| 4 GreKo only | 300 | 2535 | 2494–2575 |
+| + CLMaster64 | 330 | 2542 | 2503–2580 |
+| + CLMaster64 + TheKing 3.50 | 345 | 2534 | 2496–2572 |
 
-**Best estimate: about 2600 ± 100** (5+3, PyPy3, 1 process).
+With `Processes 4`, expect roughly another +50–100 Elo (not yet measured).
 
-TheKing 3.50 clearly plays above its listed 2700 on modern hardware (Pawny and TheKing can't both be 2700 when CLCENnetPy scores 53% against one and 7% against the other), which is why the two-anchor figure is preferred.
+The PGNs for all these games are in the `pgn/` folder.
 
 ### Other test results (not used in the rating)
-- **CLNeptune64** (Greko 2020 derivative) was left out: that build showed 0.00 evals even at depth 22 and lost every game in 17–28 moves, a sign of a broken eval.
+- **CLNeptune64** (GreKo 2020 derivative) was left out: that build showed 0.00 evals even at depth 22 and lost every game in 17–28 moves, a sign of a broken eval.
+- **TheKing 3.50** (original, listed 2700) scored 13 of 15 against CLCENnetPy. It clearly plays well above its listed rating on modern hardware, so it is not used as an anchor.
 - **TheKing350 UCI legacy** (K7's UCI port of TheKing 3.50) scored about 75% against CLCENnetPy, close to the original.
-- At 120+6: beat CLVeloci (~2600), K7Homebrew v5.1 (~2350) and CLK7HomebrewPy; drew TheKing350 UCI twice; lost to CL28KELO (~2800).
+- At 120+6: beat CLVeloci and CLK7HomebrewPy, beat K7Homebrew v5.1 (~2350) in a game, drew TheKing350 UCI twice, and lost to CL28KELO (~2800).
+- Earlier, smaller samples gave estimates of about 2600 ± 100. The 315-game result above replaces them.
 
 ### Where the limits are
 - At 120+6 it reaches about **depth 13–14** in the middlegame (15–17 with 4 processes). Engines that see 18+ plies can win with ideas past that horizon.
 - Net size matters in Python: **256–512 hidden** nets give the best balance. 768 and 1024 nets judge positions better but lose too much depth.
 - The same engine on regular Python reaches only depth 8–11.
 
-These ratings come from K7's own testing on one machine. More games will narrow the range, and independent testing is welcome.
+These ratings come from K7's own testing on one machine. Independent testing is welcome.
 
 ---
 
 ## Requirements
 
-- Nothing to install on Windows: PyPy3 is included in the `pypy` folder just extracted from zip file. (Python 3.8+ also works, but much slower.)
+- Nothing to install on Windows: PyPy3 is included as `pypy.7z`. Extract it into the `pypy` folder with 7-Zip. **Python does not need to be installed.** (Without the `pypy` folder, the launcher uses a regular Python 3.8+ if one is installed, at only about 2100–2200 Elo; with neither, the engine will not start.)
 - Standard library only.
 - Optional: MinGW64 `gcc` to build the launcher.
-- also if wanna just play the standalone without pypy or installing any python software, and straight into arena the engine is compile already into exe in 2100 elo engine folder but you have point out the net for it in the engine configuration either k726k.k7nn or k7net.bin which is also in the 2100 elo engine folder
+
 ## License / credits
 
 CLCENnetPy and the K7NN networks by **K7**, K7 ChessLab Collection.
